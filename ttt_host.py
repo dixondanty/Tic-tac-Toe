@@ -1,247 +1,105 @@
-import cv2
-import mediapipe as mp
-import numpy as np
-import math
-import socket
-import pickle
-import struct
-import threading
-from collections import deque
-import time
-import webbrowser
+import cv2, mediapipe as mp, numpy as np, socket, struct, pickle, threading, time
 
-# --- SETTINGS ---
-WINDOW_SIZE = 600
-CELL_SIZE = WINDOW_SIZE // 3
-LINE_COLOR = (255, 255, 255)
-LINE_THICKNESS = 4
 PORT = 9999
+FRAME_SIZE = (320, 240)
 
-# --- INITIALIZATION ---
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.6)
 
 board = np.zeros((3, 3), dtype=int)
-turn = 1  # 1 for X, 2 for O
-my_player_id = 0
-winner = ''  # New variable to track the winner
+turn, my_id = 1, 0
 conn = None
-moves_queue = deque()
+winner = ''
+last_move_time = 0
+CELL_SIZE, WIN_SIZE = 200, 600
 
-
-# --- NETWORKING ---
-def network_thread(c):
-    """Listens for incoming moves from the other player."""
-    while True:
-        try:
-            data_len_packed = c.recv(8)
-            if not data_len_packed: break
-            msg_size = struct.unpack("Q", data_len_packed)[0]
-            data = b""
-            while len(data) < msg_size:
-                packet = c.recv(4096)
-                if not packet: break
-                data += packet
-            move = pickle.loads(data)
-            moves_queue.append(move)
-        except (ConnectionResetError, ConnectionAbortedError):
-            print("Connection with the other player was lost.")
-            break
-        except Exception as e:
-            print(f"Network error: {e}")
-            break
-
-
-def send_move(move):
-    """Sends a move to the other player."""
-    if conn:
-        try:
-            data = pickle.dumps(move)
-            msg = struct.pack("Q", len(data)) + data
-            conn.sendall(msg)
-        except Exception as e:
-            print(f"Failed to send move: {e}")
-
-
-# --- GESTURE HELPERS ---
-def fingers_up(hand):
-    """Returns a list of 5 booleans, one for each finger, indicating if it's up."""
-    tips = [4, 8, 12, 16, 20];
-    pips = [3, 6, 10, 14, 18];
-    res = []
-    # This logic is for a right hand held vertically.
-    # Thumb (checks horizontal position)
-    res.append(hand.landmark[tips[0]].x < hand.landmark[pips[0]].x)
-    # Other four fingers (checks vertical position)
-    for i in range(1, 5):
-        res.append(hand.landmark[tips[i]].y < hand.landmark[pips[i]].y)
-    return res
-
-
-def is_open_palm(hand):  # For Player X
-    """Checks if all five fingers are extended."""
-    return all(fingers_up(hand))
-
-
-def is_fist(hand):  # For Player O
-    """Checks if no fingers are extended."""
-    return not any(fingers_up(hand))
-
-
-def get_cell(x, y):
-    """Converts pixel coordinates to board cell coordinates (row, col)."""
-    return int(y / CELL_SIZE), int(x / CELL_SIZE)
-
-
-# --- NEW GAME LOGIC FUNCTIONS ---
-def check_win(current_board):
-    """Checks for a winner (1 or 2), a draw ('draw'), or ongoing ('')."""
-    # Check rows
+def check_win(b):
     for r in range(3):
-        if current_board[r, 0] == current_board[r, 1] == current_board[r, 2] and current_board[r, 0] != 0:
-            return current_board[r, 0]
-    # Check columns
+        if b[r,0]==b[r,1]==b[r,2]!=0: return b[r,0]
     for c in range(3):
-        if current_board[0, c] == current_board[1, c] == current_board[2, c] and current_board[0, c] != 0:
-            return current_board[0, c]
-    # Check diagonals
-    if current_board[0, 0] == current_board[1, 1] == current_board[2, 2] and current_board[0, 0] != 0:
-        return current_board[0, 0]
-    if current_board[0, 2] == current_board[1, 1] == current_board[2, 0] and current_board[0, 2] != 0:
-        return current_board[0, 2]
-    # Check for draw
-    if 0 not in current_board:
-        return 'draw'
-    # Game is still ongoing
-    return ''
+        if b[0,c]==b[1,c]==b[2,c]!=0: return b[0,c]
+    if b[0,0]==b[1,1]==b[2,2]!=0: return b[0,0]
+    if b[0,2]==b[1,1]==b[2,0]!=0: return b[0,2]
+    return 'draw' if 0 not in b else ''
 
-
-def crash_computer():
-    """Opens 100 tabs to a chaotic website."""
-    print("YOU LOSE! PREPARE FOR CHAOS.")
-    url = "https://www.omfgdogs.com/"  # A suitably chaotic choice
-    for _ in range(100):
-        webbrowser.open(url)
-
-
-# --- DRAWING ---
 def draw_board(frame):
-    for i in range(1, 3):
-        cv2.line(frame, (i * CELL_SIZE, 0), (i * CELL_SIZE, WINDOW_SIZE), LINE_COLOR, LINE_THICKNESS)
-        cv2.line(frame, (0, i * CELL_SIZE), (WINDOW_SIZE, i * CELL_SIZE), LINE_COLOR, LINE_THICKNESS)
+    for i in range(1,3):
+        cv2.line(frame,(i*CELL_SIZE,0),(i*CELL_SIZE,WIN_SIZE),(255,255,255),2)
+        cv2.line(frame,(0,i*CELL_SIZE),(WIN_SIZE,i*CELL_SIZE),(255,255,255),2)
     for r in range(3):
         for c in range(3):
-            cx, cy = c * CELL_SIZE + CELL_SIZE // 2, r * CELL_SIZE + CELL_SIZE // 2
-            if board[r, c] == 1:
-                offset = CELL_SIZE // 4
-                cv2.line(frame, (cx - offset, cy - offset), (cx + offset, cy + offset), (0, 0, 255), 4)
-                cv2.line(frame, (cx + offset, cy - offset), (cx - offset, cy + offset), (0, 0, 255), 4)
-            elif board[r, c] == 2:
-                cv2.circle(frame, (cx, cy), CELL_SIZE // 4, (255, 0, 0), 4)
+            cx, cy = c*CELL_SIZE+CELL_SIZE//2, r*CELL_SIZE+CELL_SIZE//2
+            if board[r,c]==1:
+                off=CELL_SIZE//4
+                cv2.line(frame,(cx-off,cy-off),(cx+off,cy+off),(0,0,255),3)
+                cv2.line(frame,(cx+off,cy-off),(cx-off,cy+off),(0,0,255),3)
+            elif board[r,c]==2:
+                cv2.circle(frame,(cx,cy),CELL_SIZE//4,(255,0,0),3)
 
+def send_data(sock, data):
+    pkt = pickle.dumps(data)
+    sock.sendall(struct.pack("Q", len(pkt)) + pkt)
 
-# --- MAIN ---
-if __name__ == "__main__":
-    role = input("Enter your role ('host' or 'client'): ").lower()
+def recv_data(sock):
+    data_len = struct.unpack("Q", sock.recv(8))[0]
+    data = b''
+    while len(data) < data_len:
+        packet = sock.recv(4096)
+        if not packet: return None
+        data += packet
+    return pickle.loads(data)
 
-    if role == 'host':
-        my_player_id = 1  # Host is X
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        host_ip = socket.gethostbyname(socket.gethostname())
-        s.bind(('', PORT))
-        s.listen(1)
-        print(f"Hosting on IP: {host_ip}")
-        print("Waiting for client to connect...")
-        conn, addr = s.accept()
-        print("Connected by:", addr)
-    elif role == 'client':
-        my_player_id = 2  # Client is O
-        host_ip = input("Enter host IP: ")
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.connect((host_ip, PORT))
-            conn = s
-            print("Connected to host.")
-        except Exception as e:
-            print(f"Connection failed: {e}")
-            exit()
-    else:
-        print("Invalid role.")
-        exit()
-
-    threading.Thread(target=network_thread, args=(conn,), daemon=True).start()
-
-    cap = cv2.VideoCapture(0)
-    last_gesture_time = 0
-
-    while winner == '':  # Main game loop now checks for a winner
+def send_video(sock, cap):
+    while True:
         ret, frame = cap.read()
         if not ret: break
-        frame = cv2.flip(frame, 1)
-        frame = cv2.resize(frame, (WINDOW_SIZE, WINDOW_SIZE))
-
-        # Process incoming moves first
-        if moves_queue:
-            r, c, player = moves_queue.popleft()
-            if board[r, c] == 0:
-                board[r, c] = player
-                turn = 1 if player == 2 else 2
-                winner = check_win(board)  # Check for win after opponent's move
-
-        # My turn gesture detection
-        if turn == my_player_id:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
-            if results.multi_hand_landmarks:
-                hand = results.multi_hand_landmarks[0]
-                mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
-
-                gesture_made = False
-                if my_player_id == 1:  # Player X uses Open Palm
-                    gesture_made = is_open_palm(hand)
-                elif my_player_id == 2:  # Player O uses Fist
-                    gesture_made = is_fist(hand)
-
-                if gesture_made and (time.time() - last_gesture_time > 2):
-                    pointer = hand.landmark[0]
-                    px, py = int(pointer.x * WINDOW_SIZE), int(pointer.y * WINDOW_SIZE)
-                    row, col = get_cell(px, py)
-
-                    if 0 <= row < 3 and 0 <= col < 3 and board[row, col] == 0:
-                        board[row, col] = my_player_id
-                        move = (row, col, my_player_id)
-                        send_move(move)
-                        turn = 2 if my_player_id == 1 else 1
-                        last_gesture_time = time.time()
-                        winner = check_win(board)  # Check for win after my move
-
-        draw_board(frame)
-
-        # Display game status
-        status_text = f"Turn: {'X' if turn == 1 else 'O'}"
-        if winner:
-            winner_name = 'X' if winner == 1 else 'O' if winner == 2 else 'Nobody'
-            status_text = f"Winner: {winner_name}!"
-        cv2.putText(frame, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
-
-        cv2.imshow(f"Tic-Tac-Toe (Player {my_player_id})", frame)
-        if cv2.waitKey(1) & 0xFF == 27: break
-
-    # --- Post-Game ---
-    print("Game Over!")
-    # Keep showing the final board for a few seconds
-    if 'frame' in locals():
-        draw_board(frame)
-        status_text = f"Winner: {'X' if winner == 1 else 'O' if winner == 2 else 'Nobody'}!"
-        cv2.putText(frame, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
-        cv2.imshow(f"Tic-Tac-Toe (Player {my_player_id})", frame)
-        cv2.waitKey(3000)  # Display for 3 seconds
-
+        frame = cv2.flip(cv2.resize(frame, FRAME_SIZE), 1)
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        send_data(sock, buffer)
     cap.release()
-    cv2.destroyAllWindows()
-    if conn: conn.close()
 
-    # Trigger the crash if I am the loser
-    if winner and winner != 'draw' and winner != my_player_id:
-        crash_computer()
+def recv_video(sock, q):
+    while True:
+        try:
+            buf = recv_data(sock)
+            if buf is None: break
+            frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            q.append(frame)
+            if len(q)>1: q.pop(0)
+        except: break
+
+if __name__ == "__main__":
+    role = input("Enter role (host/client): ").strip().lower()
+    if role=='host':
+        my_id=1
+        s=socket.socket(); s.bind(('',PORT)); s.listen(1)
+        print("Waiting for client...")
+        conn,addr=s.accept(); print("Connected:",addr)
+    else:
+        my_id=2
+        host=input("Enter ngrok host (ex: 0.tcp.in.ngrok.io): ")
+        port=int(input("Enter ngrok port: "))
+        s=socket.socket(); s.connect((host,port)); conn=s; print("Connected to host.")
+
+    # start video threads
+    cap=cv2.VideoCapture(0)
+    frames=[]
+    threading.Thread(target=recv_video,args=(conn,frames),daemon=True).start()
+    threading.Thread(target=send_video,args=(conn,cap),daemon=True).start()
+
+    while True:
+        if not frames: continue
+        remote_frame=cv2.resize(frames[0],FRAME_SIZE)
+        ret, local_frame=cv2.VideoCapture(0).read()
+        if not ret: break
+        local_frame=cv2.flip(cv2.resize(local_frame,FRAME_SIZE),1)
+        both=np.hstack((local_frame,remote_frame))
+        board_overlay=np.zeros((WIN_SIZE,WIN_SIZE,3),dtype=np.uint8)
+        draw_board(board_overlay)
+        board_small=cv2.resize(board_overlay,(both.shape[1],both.shape[0]))
+        display=cv2.addWeighted(both,0.8,board_small,0.4,0)
+        cv2.imshow("Gesture TicTacToe",display)
+        if cv2.waitKey(1)&0xFF==27: break
+
+    cv2.destroyAllWindows()
